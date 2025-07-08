@@ -10,6 +10,10 @@ const cron = require("node-cron");
 const NotificationModel = require("./models/NotificationModel");
 const logger = require("./config/logger");
 const expressStatusMonitor = require("express-status-monitor");
+const { SitemapStream, streamToPromise } = require("sitemap");
+const { Readable } = require("stream");
+
+const ForumModel = require("./models/forumModel"); // تأكد من صحة اسم الملف
 
 // استيراد الراوترات
 const userRouter = require("./router/UsersRouter");
@@ -41,63 +45,72 @@ const dynamicMetaMiddleware = require("./middleware/dynamicMetaMiddleware");
 
 const app = express();
 const server = http.createServer(app);
+
 // تفعيل الضغط
 app.use(compression());
 // تفعيل تصغير الملفات (CSS, JS)
 app.use(minify());
 app.use(expressStatusMonitor());
-// إعداد التخزين للملفات المرفوعة - استخدام الذاكرة المؤقتة لتجنب مشكلة نظام الملفات للقراءة فقط على Vercel
+
+// إعداد التخزين للملفات المرفوعة
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // حد أقصى 10 ميجابايت
-  }
+  limits: { fileSize: 10 * 1024 * 1024 } // 10 ميجابايت
 });
+
 // إعدادات البرامج الوسيطة
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-app.use(
-  session({
-    secret: "your_jwt_secret",
-    resave: true,
-    saveUninitialized: true,
-    cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }, // 24 hours
-  })
-);
+app.use(session({
+  secret: "your_jwt_secret",
+  resave: true,
+  saveUninitialized: true,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000, // 24 ساعة
+  }
+}));
+
 // إعداد محرك العرض
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
-// تحسين تقديم الملفات الثابتة مع تفعيل التخزين المؤقت
+
+// تحسين تقديم الملفات الثابتة مع التخزين المؤقت
 app.use(express.static(path.join(__dirname, "public"), {
-  maxAge: '1d', // تخزين مؤقت لمدة يوم واحد
+  maxAge: '1d',
   etag: true
 }));
-// تم إزالة مسار uploads لتجنب مشكلة نظام الملفات للقراءة فقط على Vercel
-// يجب استخدام خدمة تخزين سحابية للملفات المرفوعة
 
-// إضافة الميدلوير الجديد للميتا الديناميكية
+// إزالة مسار uploads بسبب القيود على Vercel
+// استخدام التخزين السحابي للملفات المرفوعة
+
+// إضافة الميدلوير للميتا الديناميكية
 app.use(dynamicMetaMiddleware);
 
-// Middleware لحساب unreadCount وتمريره إلى جميع الصفحات
+// Middleware لحساب unreadCount وتمريره لكل الصفحات
 app.use(async (req, res, next) => {
   if (req.session && req.session.userId) {
     try {
       const unreadCount = await NotificationModel.getUnreadCount(req.session.userId);
       res.locals.unreadCount = unreadCount || 0;
     } catch (err) {
-      logger.error("حدث خطأ أثناء حساب unreadCount:", err);
+      logger.error("خطأ أثناء حساب unreadCount:", err);
     }
   } else {
     res.locals.unreadCount = 0;
   }
   next();
 });
-// تطبيق Middleware عالمي للتحقق من الدور
+
+// Middleware عالمي للتحقق من الدور
 app.use(GlobalRoleController.setGlobalRole);
-// جعل صفحة المنتدى هي الصفحة الرئيسية
+
+// الصفحة الرئيسية - المنتدى
 app.get("/", ForumController.getAllPosts);
+
 // دمج الراوترات
 app.use("/", userRouter);
 app.use("/", changePasswordRoutes);
@@ -120,9 +133,9 @@ app.use("/admin", adminForumSettingsRoutes);
 app.use("/admin", adminJobProjectSettingsRoutes);
 app.use("/admin", adminUsersRoutes);
 app.use("/", require("./router/GlobalRoleRouter"));
+
 // مسارات ثابتة للصفحات
 app.get('/about', (req, res) => {
-  // إضافة بيانات الصفحة للميتا الديناميكية
   res.locals.pageName = 'about';
   res.render('about', {
     unreadCount: res.locals.unreadCount,
@@ -132,7 +145,6 @@ app.get('/about', (req, res) => {
 });
 
 app.get('/privacy', (req, res) => {
-  // إضافة بيانات الصفحة للميتا الديناميكية
   res.locals.pageName = 'privacy';
   res.render('privacy', {
     unreadCount: res.locals.unreadCount,
@@ -143,7 +155,6 @@ app.get('/privacy', (req, res) => {
 
 // مسار مستقل لـ /ProjectSpace
 app.get("/ProjectSpace", (req, res) => {
-  // إضافة بيانات الصفحة للميتا الديناميكية
   res.locals.pageName = 'ProjectSpace';
   res.render("ProjectSpace", {
     errorMessage: null,
@@ -153,21 +164,50 @@ app.get("/ProjectSpace", (req, res) => {
     unreadCount: res.locals.unreadCount
   });
 });
-// جدولة حذف الإعلانات القديمة
+
+// مسار السايت ماب الديناميكي
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const posts = await ForumModel.getAllPosts(null);
+    const links = [
+      { url: '/', changefreq: 'daily', priority: 1.0 },
+      { url: '/about', changefreq: 'monthly', priority: 0.7 },
+      { url: '/privacy', changefreq: 'yearly', priority: 0.5 },
+      ...posts.map(post => ({
+        url: `/forum/post/${post.id}`,
+        changefreq: 'weekly',
+        priority: 0.8
+      }))
+    ];
+
+    const stream = new SitemapStream({ hostname: 'https://www.amlhabrak.online' });
+    res.writeHead(200, {
+      'Content-Type': 'application/xml'
+    });
+
+    const xmlString = await streamToPromise(Readable.from(links).pipe(stream)).then(data => data.toString());
+    res.end(xmlString);
+
+  } catch (e) {
+    console.error('خطأ في توليد السايت ماب:', e);
+    res.status(500).end();
+  }
+});
+
+// جدولة حذف الإعلانات القديمة يومياً
 cron.schedule('0 0 * * *', async () => {
   try {
-    const forumModel = require("./models/forumModel"); // تصحيح حالة الأحرف في اسم الملف
-    await forumModel.deleteOldAds();
-    console.log('Scheduled deletion of old ads completed.');
+    await ForumModel.deleteOldAds();
+    console.log('تم حذف الإعلانات القديمة بنجاح.');
   } catch (err) {
-    logger.error("Error in scheduled deletion:", err);
+    logger.error("خطأ في حذف الإعلانات المجدولة:", err);
   }
 }, {
   scheduled: true,
   timezone: "Asia/Riyadh"
 });
 
-// Middleware لمعالجة الأخطاء (يجب أن يكون في النهاية)
+// Middleware لمعالجة الأخطاء (في النهاية)
 app.use(errorHandler);
 
 // إعداد socket.io
@@ -176,53 +216,38 @@ const chatModel = require('./models/chatModel');
 const UsersModels = require('./models/UsersModels');
 
 const io = new Server(server, {
-  cors: {
-    origin: '*', // يمكنك تخصيصها لاحقًا
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-// خريطة لربط userId مع socketId
 const userSocketMap = new Map();
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  // عند الاتصال، يجب أن يرسل العميل userId
   socket.on('join_chat', ({ userId, friendId }) => {
     console.log(`User ${userId} joined chat with ${friendId}. Socket: ${socket.id}`);
-    socket.join(userId); // ينضم المستخدم إلى غرفة باسم معرفه الخاص
-    socket.userId = userId; // تخزين userId في كائن socket
-    userSocketMap.set(userId, socket.id); // تحديث الخريطة
+    socket.join(userId);
+    socket.userId = userId;
+    userSocketMap.set(userId, socket.id);
   });
 
-  // استقبال رسالة دردشة
   socket.on('send_message', async (messageData) => {
     console.log('Received send_message:', messageData);
     try {
-      // messageData يجب أن تحتوي على جميع البيانات اللازمة (sender_id, receiver_id, content, image_path, etc.)
-      // لا حاجة لحفظ الرسالة هنا مرة أخرى إذا كانت قد حفظت بالفعل في مسار API
-      // فقط أعد إرسالها إلى الطرفين
-
-      // إرسال الرسالة إلى المرسل
       io.to(messageData.sender_id).emit('new_message', messageData);
-      // إرسال الرسالة إلى المستقبل
       io.to(messageData.receiver_id).emit('new_message', messageData);
-
     } catch (err) {
       console.error('Socket send_message error:', err);
     }
   });
 
-  // استقبال طلب حذف رسالة
   socket.on('delete_message', async (messageId) => {
     console.log('Received delete_message for ID:', messageId);
     try {
-      const message = await chatModel.getMessageById(messageId); // جلب الرسالة لمعرفة المرسل والمستقبل
+      const message = await chatModel.getMessageById(messageId);
       if (message) {
-        const deleted = await chatModel.deleteMessage(messageId); // حذف الرسالة من قاعدة البيانات
+        const deleted = await chatModel.deleteMessage(messageId);
         if (deleted) {
-          // إرسال إشعار الحذف إلى الطرفين
           io.to(message.sender_id).emit('message_deleted', messageId);
           io.to(message.receiver_id).emit('message_deleted', messageId);
         }
@@ -232,10 +257,8 @@ io.on('connection', (socket) => {
     }
   });
 
-  // عند قطع الاتصال
   socket.on('disconnect', () => {
     console.log('Socket disconnected:', socket.id);
-    // إزالة المستخدم من الخريطة عند قطع الاتصال
     for (let [key, value] of userSocketMap.entries()) {
       if (value === socket.id) {
         userSocketMap.delete(key);
@@ -244,10 +267,8 @@ io.on('connection', (socket) => {
     }
   });
 });
-const PORT = process.env.PORT || 8080;
 
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
-
-
